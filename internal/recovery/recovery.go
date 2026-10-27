@@ -1,9 +1,6 @@
-// Package recovery implements the guess-limited key recovery flow: OPAQUE
-// login (RFC 9807) so the server never sees the PIN, Argon2id PIN
-// stretching, and a server-side guess counter that destroys the secret
-// share after ~10 wrong attempts. Phase 2. See "Making the guess limit
-// trustworthy" in docs/architecture.md for the production split-trust
-// (SVR3-style) direction beyond a single-server MVP.
+// Package recovery reserves unavailable recovery interfaces. An ordinary server
+// with OPAQUE and a guess counter does not withstand server compromise. No
+// reviewed recovery protocol is implemented; all functions fail closed.
 package recovery
 
 import (

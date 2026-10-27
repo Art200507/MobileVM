@@ -1,13 +1,5 @@
-// Command recovery-service is the cloud-side guess-limited key recovery
-// server: OPAQUE registration/login so it never sees the PIN, Argon2id
-// verification, and a per-account guess counter that destroys the secret
-// share after MaxGuesses wrong attempts. Phase 2.
-//
-// For an MVP this is a single server with rate limiting. A real product
-// should split the share across independently-operated enclaves
-// (Signal-SVR3-style split trust) so no single compromised server or admin
-// can lift the guess limit — see "Making the guess limit trustworthy" in
-// docs/architecture.md.
+// Command recovery-service is unavailable pending selection of a reviewed
+// recovery protocol, compromise assumptions and abuse-resistant attempt limits.
 package main
 
 import "log"

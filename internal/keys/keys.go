@@ -1,60 +1,47 @@
-// Package keys implements the key hierarchy described in docs/architecture.md
-// (Master key -> block key / block-ID key / signing key via HKDF, plus
-// per-session cache keys). Implementation belongs to Phase 1 (block keys)
-// and Phase 3 (session cache keys); this file only fixes the shape.
+// Package keys derives disk-scoped development keys from a portable data root.
+// Device wrapping and protected memory are separate, unimplemented layers.
 package keys
 
-import "errors"
+import (
+	"crypto/hkdf"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/binary"
 
-var errNotImplemented = errors.New("keys: not implemented yet (see docs/architecture.md Build plan)")
+	"shadowdevice/internal/protocol"
+)
 
-// MasterKeySize is the size in bytes of the random 256-bit master key.
 const MasterKeySize = 32
 
-// MasterKey is the single random key that everything else derives from.
-// It is generated on the owner's phone and never seen by the server.
 type MasterKey [MasterKeySize]byte
-
-// BlockKey encrypts the contents of every disk block. Derived as
-// HKDF(MK, "blocks").
 type BlockKey [32]byte
-
-// BlockIDKey derives keyed block identifiers so the cloud can't spot
-// identical blocks across snapshots or accounts. Derived as
-// HKDF(MK, "ids").
 type BlockIDKey [32]byte
-
-// SessionCacheKey protects blocks cached in the protected VM's memory on a
-// borrowed phone. Random per session; destroyed (crypto-shredded) when the
-// session ends. See Phase 3.
 type SessionCacheKey [32]byte
 
-// GenerateMasterKey produces a new random 256-bit master key on the owner's
-// device. Phase 1.
-func GenerateMasterKey() (MasterKey, error) {
-	return MasterKey{}, errNotImplemented
+func GenerateMasterKey() (MasterKey, error) { var k MasterKey; _, e := rand.Read(k[:]); return k, e }
+func derive(mk MasterKey, disk protocol.DiskID, epoch uint64, label string) ([32]byte, error) {
+	salt := append([]byte{}, disk[:]...)
+	salt = binary.BigEndian.AppendUint64(salt, epoch)
+	raw, e := hkdf.Key(sha256.New, mk[:], salt, "shadowdevice/v1/"+label, 32)
+	var out [32]byte
+	copy(out[:], raw)
+	clear(raw)
+	return out, e
 }
-
-// DeriveBlockKey derives the block content key from the master key via
-// HKDF-SHA256 with info "blocks". Phase 1.
-func DeriveBlockKey(mk MasterKey) (BlockKey, error) {
-	return BlockKey{}, errNotImplemented
+func DeriveBlockKey(mk MasterKey, disk protocol.DiskID, epoch uint64) (BlockKey, error) {
+	k, e := derive(mk, disk, epoch, "blocks")
+	return BlockKey(k), e
 }
-
-// DeriveBlockIDKey derives the block-ID key from the master key via
-// HKDF-SHA256 with info "ids". Phase 1.
-func DeriveBlockIDKey(mk MasterKey) (BlockIDKey, error) {
-	return BlockIDKey{}, errNotImplemented
+func DeriveBlockIDKey(mk MasterKey, disk protocol.DiskID, epoch uint64) (BlockIDKey, error) {
+	k, e := derive(mk, disk, epoch, "ids")
+	return BlockIDKey(k), e
 }
-
-// NewSessionCacheKey generates a fresh random session cache key inside the
-// protected VM. Phase 3.
 func NewSessionCacheKey() (SessionCacheKey, error) {
-	return SessionCacheKey{}, errNotImplemented
+	var k SessionCacheKey
+	_, e := rand.Read(k[:])
+	return k, e
 }
 
-// Shred overwrites and discards a session cache key when a session ends,
-// so cached blocks on the borrowed phone become unreadable. Phase 3.
-func (k *SessionCacheKey) Shred() {
-	// TODO(phase 3): zero k in place; caller drops the reference.
-}
+// Shred clears this value only. Copies, runtime buffers and forensic erasure are
+// not covered; this is not an enforced session revocation mechanism.
+func (k *SessionCacheKey) Shred() { clear(k[:]) }

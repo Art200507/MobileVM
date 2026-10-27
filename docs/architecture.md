@@ -1,95 +1,92 @@
-# ShadowDevice: Security Architecture (v5)
+# ShadowDevice architecture
 
-Condensed from `ShadowDevice Security Architecture.pdf` for quick reference during
-implementation. See the PDF for full detail, threat tables, and sources.
+Status: development prototype, 2026-10-25. This document describes implemented
+behavior. [architecture-v5.md](architecture-v5.md) preserves the historical
+proposal. The [design review](design-review.md) covers its unsupported claims.
 
-## Idea
+## Implemented trust boundary
 
-Your "phone" lives inside a VM from day one. The VM's disk syncs to the cloud as
-encrypted blocks. Any supported Android phone can stream and decrypt it after you
-prove who you are: enter a short code + PIN, get your persona running inside an app
-on someone else's phone, and leave nothing behind when you close it.
+The sync process and reader process run on trusted development machines. They
+handle plaintext and portable secret keys in ordinary Go process memory. The
+filesystem holding their identity files is trusted. The storage server receives
+sealed blocks and signed manifests, not plaintext or secret keys.
 
-## Four core rules
+A reader must possess a separately provisioned reader identity (disk ID, data root
+and signing public key) and an independently trusted manifest digest. Neither
+identity nor checkpoint is obtained from the ciphertext server. This prevents
+substitution of the expected snapshot. It does not discover the latest snapshot
+for a fresh device. Reading an explicitly pinned old snapshot is allowed.
 
-1. **The cloud never sees plaintext.** It stores encrypted, fixed-size blocks only.
-2. **The code never is the key.** A random 256-bit master key (MK) encrypts
-   everything. Code + PIN only unlock it via a guess-limited recovery service.
-3. **Stream, don't download.** The borrowed phone fetches only the blocks it touches.
-4. **Assume the borrowed phone is hostile.** Decrypted data stays in protected VM
-   memory, never on disk; sessions are time-limited, one-time, remotely killable.
+## Disk format v1
 
-## Components (3 zones)
+- Blocks contain 4 MiB of padded plaintext. Geometry, including exact byte length,
+  is signed and visible; access patterns and object reuse remain visible.
+- HKDF-SHA256 derives separate disk/epoch encryption and object-ID keys from a
+  portable random 256-bit data root. The signing seed is independent.
+- Each sealed block has a fresh 256-bit salt deriving a per-object AES-256 key.
+  Go's AES-GCM random-nonce API prepends its 96-bit nonce and appends the tag.
+  Each derived object key seals one message; reusing an object does not reseal it.
+- AEAD binds format, disk ID, epoch, logical index, generation and salt. Generation
+  records creation, rather than every subsequent snapshot that references it.
+- HMAC-SHA256 object IDs cover the complete authenticated header and sealed body.
+  Readers compare object context and ID against a verified manifest entry.
+- Ed25519 signatures cover format/suite, disk ID, epoch, version, parent hash,
+  exact disk length, block size, entry count and ordered Merkle root. Leaves bind
+  index/generation/object ID; leaf and parent hashes have different prefixes.
+  Odd Merkle levels duplicate the last node; an empty image has a distinct root.
+- All integer encodings used for cryptography are fixed-width big endian; suite
+  text has a 32-bit length prefix. Manifest JSON is transport only. Object binary
+  fields are format:u32, disk:16 bytes, epoch:u64, index:u64, generation:u64,
+  salt:32 bytes, and sealed body:4 MiB+28 bytes. Object size is 4,194,408 bytes.
 
-- **Your phone:** hardware keystore (MK + signing key), Persona VM, sync agent.
-- **Cloud (ciphertext only):** recovery service, lease server, block store, signed
-  manifest.
-- **Borrowed phone:** ShadowDevice app (attested), protected VM (pKVM, RAM-only
-  decrypt), wiped cache on session end.
+AES was selected from the original proposal's supported alternatives to use Go's
+standard cryptographic implementations without adding a dependency. This replaces
+XChaCha20 as the proposed initial suite in the older plan. No cipher negotiation
+or custom cryptographic primitives are implemented. Reference:
+[Go random-nonce GCM](https://pkg.go.dev/crypto/cipher#NewGCMWithRandomNonce),
+[Go HKDF](https://pkg.go.dev/crypto/hkdf).
 
-## Keys
+## Snapshot publication
 
-| Key | Derived from | Protects | Lives where |
-|---|---|---|---|
-| Master key (MK) | 256 random bits, generated on your phone | everything | hardware keystore; wrapped copies in recovery service |
-| Block key | HKDF(MK, "blocks") | block contents | memory only |
-| Block-ID key | HKDF(MK, "ids") | block names (anti-dedup-leak) | memory only |
-| Signing key | Ed25519, generated on your phone | manifest | hardware keystore; pubkey registered with server |
-| Session cache key | random per session | blocks cached on borrowed phone | protected VM memory only, destroyed at session end |
+The writer takes a caller-supplied frozen/offline raw image, not a live VM. It
+reads blocks incrementally and compares against authenticated prior blocks to
+reuse unchanged objects. It does not provide plaintext-hash deduplication.
 
-## Block encryption
+Immutable objects and manifests are written through synced temporary files and
+published using non-overwriting links. After checking every referenced object is
+present and structurally consistent, a process-shared file lock protects the
+expected-parent check and head update. The head is replaced by rename and the
+directory is synced. The store is single-disk/single-signing-authority; a stale
+parent returns a conflict and does not replace the head. Failed uploads may leave
+orphan objects. GC and multi-provider replication are not implemented.
 
-- Fixed 4 MB blocks, XChaCha20-Poly1305 (or AES-256-GCM), fresh random nonce.
-- AAD includes block index + snapshot version (prevents swap/replay).
-- Manifest: Merkle tree over block IDs, signed, monotonic version counter.
+Filesystem stat checks detect some changes during publication. They cannot prove
+that an image was frozen or applications were quiesced. Local filesystem durability,
+path ownership and supported fsync/locking behavior remain assumptions. The head
+service is trusted for serialization; a malicious service could fork histories.
 
-## Unlock flow (borrowed phone)
+## On-demand access
 
-1. Enter account code (rotates each session) + PIN.
-2. OPAQUE login (RFC 9807) — server never sees the PIN.
-3. Argon2id-stretch PIN → ask recovery service for secret share (~10 guess limit,
-   Signal-SVR-style; SVR3 split-trust model for production).
-4. PIN-derived key + share unwrap MK inside the protected VM only.
+The reader fetches only requested blocks, authenticates them, and retains at most
+one decrypted block. It implements io.ReaderAt, including cross-block and final
+partial reads. Network responses and metadata are bounded. A missing/corrupt block
+is an error; it is never replaced with zeroes.
 
-## Compatibility
+The ciphertext HTTP service is read-only and requires numeric loopback binding.
+The reader can optionally expose plaintext single-range reads on a second
+loopback endpoint for local VM tools. That endpoint authenticates the entire
+requested range before replying, caps a request at 32 MiB, and denies writes.
+It deliberately exposes plaintext to the trusted local host. It is not a protected
+VM channel. No Linux VM boot or Android hardware experiment has been completed.
 
-| Phone | Mode |
-|---|---|
-| Pixel 6+ (Tensor), Android 16+ | Full VM |
-| Samsung Galaxy S26/S26+ (Exynos) | Full VM, reported/unverified |
-| Snapdragon Android | Essentials Vault |
-| iPhone | Essentials Vault (no JIT, apps sandboxed) |
-| Any browser | Essentials Vault (web) |
+## Features deliberately unavailable
 
-Full VM runs Android apps via Waydroid inside the AVF Debian guest — **unproven,
-least-validated part of the design.** Banking apps fail Play Integrity inside a VM.
-No SIM, so SMS 2FA needs an authenticator app or vault backup codes.
+PIN/OPAQUE recovery, Android protected execution/attestation, hardware wrapping,
+signer migration/rotation, leases/fencing, enforced expiration, duress mode,
+Essentials Vault, writable remote sessions, background owner sync and GC.
+Existing recovery/session interfaces return errors; they are not production paths.
 
-## Build plan (phase gates)
-
-0. **Feasibility spike** — Waydroid inside AVF Debian on a real Pixel. Gate: one
-   Android app opens inside the VM. *(needs physical hardware)*
-1. **Encrypted streaming (core MVP)** — split a Linux VM disk into encrypted 4 MB
-   blocks on a server; a second device boots it by fetching blocks on demand. Gate:
-   boots without full download; server only ever holds ciphertext.
-2. **Key recovery** — OPAQUE login, Argon2id, server-side guess limit, printed
-   recovery kit. Gate: 10 wrong PINs locks the share; kit still recovers.
-3. **Hostile-guest hardening** — protected VM, RAM-only crypto-shredded cache, app
-   attestation, one-time codes, session timer, remote kill. Gate: nothing readable
-   left on the guest after a session.
-4. **Essentials Vault** — contacts/notes/documents/backup codes, any phone/browser.
-   Gate: works on an iPhone.
-5. **Owner sync** — background delta sync, single-active lease, duress PIN. Gate: a
-   day of normal use syncs within a data budget.
-
-Phases 1–3 alone are a strong standalone deliverable. Phase 0 decides whether the
-full "apps on any phone" version is realistic.
-
-## Open risks
-
-- Protected VMs (memory-hidden) vs. GPU-capable VMs (needed for Waydroid) may be
-  mutually exclusive on current hardware.
-- Waydroid-in-AVF is unproven on phones.
-- Full-VM device coverage is currently a minority of phones.
-- Screen capture on a compromised guest is not solvable in software.
-- First full sync of a large persona VM is slow/costly — keep it tens of GB, not 256.
+Revocation cannot erase previously copied secrets or stop an offline device.
+Clearing owned Go buffers does not prove erasure of runtime copies or host caches.
+Hostile keyboard/display protection, endpoint supply-chain trust, app distribution,
+MDM consent and production legal/economic decisions remain separate gates.

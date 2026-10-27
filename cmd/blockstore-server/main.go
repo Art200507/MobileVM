@@ -1,18 +1,37 @@
-// Command blockstore-server is the cloud-side server that stores encrypted
-// 4 MB blocks and signed manifests, and serves them to guest clients on
-// demand. It never holds plaintext or any key material. Phase 1 (core MVP).
-//
-// Planned responsibilities (see docs/architecture.md):
-//   - PUT block: accept an EncryptedBlock keyed by its BlockID, reject
-//     overwrites of an existing ID (blocks are content-addressed).
-//   - PUT manifest: accept a signed Manifest, reject it if Version is not
-//     strictly greater than the last stored version for the account.
-//   - GET block/{id}: serve ciphertext for a single block.
-//   - GET manifest/{accountID}: serve the latest signed manifest.
+// Command blockstore-server exposes a read-only, loopback development store.
 package main
 
-import "log"
+import (
+	"flag"
+	"fmt"
+	"log"
+	"net"
+	"net/http"
+	"time"
+
+	"shadowdevice/internal/store"
+)
 
 func main() {
-	log.Fatal("blockstore-server: not implemented yet (Phase 1, see docs/architecture.md)")
+	root := flag.String("store", "", "ciphertext directory")
+	addr := flag.String("listen", "127.0.0.1:8080", "loopback listen address")
+	flag.Parse()
+	if *root == "" {
+		log.Fatal("-store required")
+	}
+	host, _, e := net.SplitHostPort(*addr)
+	if e != nil {
+		log.Fatal(e)
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || !ip.IsLoopback() {
+		log.Fatal("development server requires a numeric loopback address")
+	}
+	s, e := store.Open(*root)
+	if e != nil {
+		log.Fatal(e)
+	}
+	server := http.Server{Addr: *addr, Handler: s.Handler(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 30 * time.Second, MaxHeaderBytes: 8192}
+	fmt.Printf("Read-only development ciphertext server: http://%s\n", *addr)
+	log.Fatal(server.ListenAndServe())
 }
